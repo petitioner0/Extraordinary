@@ -8,6 +8,7 @@ import net.minecraft.client.CloudStatus;
 import net.minecraft.client.renderer.GameRenderer;
 import net.minecraft.client.renderer.state.GameRenderState;
 import net.minecraft.resources.Identifier;
+import org.joml.Matrix4f;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -35,6 +36,15 @@ public abstract class ChokmahGameRendererMixin {
 		if (ChokmahClient.isControllingCamera()) {
 			requestedPostEffects.add(CHOKMAH_HALO);
 		}
+	}
+
+	@ModifyArg(
+			method = "renderLevel",
+			at = @At(value = "INVOKE", target = "Lnet/minecraft/client/renderer/ProjectionMatrixBuffer;getBuffer(Lorg/joml/Matrix4f;)Lcom/mojang/renderpearl/api/buffers/GpuBufferSlice;")
+	)
+	private Matrix4f extraordinary$captureChokmahPickingProjection(Matrix4f projection) {
+		ChokmahClient.captureBlockPickingFrame(gameRenderState.levelRenderState.cameraRenderState, projection);
+		return projection;
 	}
 
 	@ModifyArg(

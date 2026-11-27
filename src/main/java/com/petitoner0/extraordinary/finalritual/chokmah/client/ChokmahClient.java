@@ -1,5 +1,7 @@
 package com.petitoner0.extraordinary.finalritual.chokmah.client;
 
+import com.mojang.blaze3d.platform.Window;
+import com.mojang.blaze3d.systems.RenderSystem;
 import com.petitoner0.extraordinary.Extraordinary;
 import com.petitoner0.extraordinary.finalritual.chokmah.ChokmahArea;
 import com.petitoner0.extraordinary.finalritual.chokmah.ChokmahCameraPayload;
@@ -14,19 +16,26 @@ import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
 import net.fabricmc.fabric.api.client.rendering.v1.level.LevelExtractionEvents;
 import net.minecraft.client.Camera;
+import net.minecraft.client.Minecraft;
 import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.state.level.CameraRenderState;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.SectionPos;
 import net.minecraft.util.Mth;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.dimension.DimensionType;
+import net.minecraft.world.phys.Vec2;
 import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix4f;
 
 import java.time.Duration;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class ChokmahClient implements ClientModInitializer {
 	private static final long CAMERA_FLIGHT_DURATION_NANOS = Duration.ofSeconds(8).toNanos();
+	private static final long CAMERA_DESCENT_TURN_DURATION_NANOS = Duration.ofSeconds(1).toNanos();
+	private static final double CAMERA_DESCENT_BRAKING_START = 0.75;
+	private static final float CAMERA_DESCENT_MAX_FOV_BONUS = 15.0F;
 	private static final double CAMERA_TARGET_X_OFFSET = 124.45;
 	private static final double CAMERA_TARGET_Z_OFFSET = -124.45;
 	private static final double CAMERA_TARGET_Y = 160.0;
@@ -40,6 +49,7 @@ public final class ChokmahClient implements ClientModInitializer {
 	private static volatile SectionPos chunkAnchor;
 	private static LocalPlayer cameraPlayer;
 	private static CameraFlight cameraFlight;
+	private static ChokmahBlockPickingFrame blockPickingFrame;
 
 	@Override
 	public void onInitializeClient() {
@@ -121,12 +131,67 @@ public final class ChokmahClient implements ClientModInitializer {
 				CAMERA_TARGET_Y,
 				startPosition.z() + CAMERA_TARGET_Z_OFFSET);
 		CameraPose target = new CameraPose(targetPosition, CAMERA_TARGET_YAW, CAMERA_TARGET_PITCH, 1.0F);
-		cameraFlight = new CameraFlight(start, target, System.nanoTime());
+		cameraFlight = new CameraFlight(start, target, System.nanoTime(), true);
+	}
+
+	public static void captureBlockPickingFrame(CameraRenderState camera, Matrix4f projection) {
+		if (cameraFlight == null || !cameraFlight.orbitOnArrival() || camera.projectionMatrix.m23() != 0.0F) {
+			return;
+		}
+
+		boolean enteringOrbit = blockPickingFrame == null;
+		CameraPose pose = new CameraPose(camera.pos, camera.yRot, camera.xRot, 1.0F);
+		Matrix4f inverseViewProjection = new Matrix4f(projection).mul(camera.viewRotationMatrix).invert();
+		float farClipDepth = RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 0.0F : -1.0F;
+		blockPickingFrame = new ChokmahBlockPickingFrame(pose, inverseViewProjection, farClipDepth);
+		if (enteringOrbit) {
+			Minecraft.getInstance().mouseHandler.releaseMouse();
+		}
+	}
+
+	public static boolean isSelectingBlock() {
+		return blockPickingFrame != null;
+	}
+
+	public static void selectBlock(Minecraft client) {
+		if (blockPickingFrame == null || client.level == null || chunkAnchor == null) {
+			return;
+		}
+
+		Window window = client.getWindow();
+		double x = client.mouseHandler.xpos() / window.getScreenWidth();
+		double y = client.mouseHandler.ypos() / window.getScreenHeight();
+		if (!(x >= 0.0 && x < 1.0 && y >= 0.0 && y < 1.0)) {
+			return;
+		}
+
+		Vec3 landingPosition = blockPickingFrame.landingPosition(client.level, chunkAnchor, x, y);
+		if (landingPosition != null) {
+			CameraPose start = blockPickingFrame.pose();
+			Vec3 direction = start.position().vectorTo(landingPosition);
+			Vec2 heading = direction.lengthSqr() > 0.0 ? direction.rotation() : new Vec2(start.pitch(), start.yaw());
+			CameraPose destination = new CameraPose(landingPosition, heading.y, heading.x, 0.0F);
+			cameraFlight = new CameraFlight(start, destination, System.nanoTime(), false);
+			closeBlockPicker();
+		}
+	}
+
+	private static void closeBlockPicker() {
+		if (blockPickingFrame == null) {
+			return;
+		}
+
+		blockPickingFrame = null;
+		Minecraft client = Minecraft.getInstance();
+		if (client.level != null && client.gui.screen() == null && client.gui.overlay() == null) {
+			client.mouseHandler.grabMouse();
+		}
 	}
 
 	private static void releaseCamera() {
 		chunkAnchor = null;
 		cameraFlight = null;
+		closeBlockPicker();
 		EDGE_LOG_SAMPLES.set(0);
 		if (cameraPlayer != null) {
 			ChokmahArea.clear(cameraPlayer);
@@ -134,24 +199,55 @@ public final class ChokmahClient implements ClientModInitializer {
 		}
 	}
 
-	public record CameraPose(Vec3 position, float yaw, float pitch, float flightProgress) {
+	public record CameraPose(Vec3 position, float yaw, float pitch, float flightProgress, float fovBonus) {
+		public CameraPose(Vec3 position, float yaw, float pitch, float flightProgress) {
+			this(position, yaw, pitch, flightProgress, 0.0F);
+		}
 	}
 
-	private record CameraFlight(CameraPose start, CameraPose target, long startedAtNanos) {
+	private record CameraFlight(CameraPose start, CameraPose target, long startedAtNanos, boolean orbitOnArrival) {
 		private CameraPose currentPose() {
 			long elapsedNanos = System.nanoTime() - startedAtNanos;
 			if (elapsedNanos >= CAMERA_FLIGHT_DURATION_NANOS) {
 				double orbitSeconds = (elapsedNanos - CAMERA_FLIGHT_DURATION_NANOS) / 1_000_000_000.0;
-				return orbitPose(orbitSeconds);
+				return orbitOnArrival ? orbitPose(orbitSeconds) : target;
 			}
 
 			double elapsedFraction = elapsedNanos / (double) CAMERA_FLIGHT_DURATION_NANOS;
+			if (!orbitOnArrival) {
+				return descendingPose(elapsedNanos, elapsedFraction);
+			}
+
 			double progress = elapsedFraction * elapsedFraction;
+			return interpolatePose(progress, (float) progress, 0.0F);
+		}
+
+		private CameraPose descendingPose(long elapsedNanos, double elapsedFraction) {
+			// Accelerate until the braking point, then slow to a stop at the destination.
+			double distanceProgress;
+			double speedFraction;
+			if (elapsedFraction < CAMERA_DESCENT_BRAKING_START) {
+				speedFraction = elapsedFraction / CAMERA_DESCENT_BRAKING_START;
+				distanceProgress = elapsedFraction * speedFraction;
+			} else {
+				double remainingFraction = 1.0 - elapsedFraction;
+				speedFraction = remainingFraction / (1.0 - CAMERA_DESCENT_BRAKING_START);
+				distanceProgress = 1.0 - remainingFraction * speedFraction;
+			}
+
+			float turnTime = (float) Math.min(1.0, elapsedNanos / (double) CAMERA_DESCENT_TURN_DURATION_NANOS);
+			float turnProgress = turnTime * turnTime * (3.0F - 2.0F * turnTime);
+			float fovBonus = (float) speedFraction * CAMERA_DESCENT_MAX_FOV_BONUS;
+			return interpolatePose(distanceProgress, turnProgress, fovBonus);
+		}
+
+		private CameraPose interpolatePose(double distanceProgress, float turnProgress, float fovBonus) {
 			return new CameraPose(
-					start.position().lerp(target.position(), progress),
-					Mth.rotLerp((float) progress, start.yaw(), target.yaw()),
-					Mth.lerp((float) progress, start.pitch(), target.pitch()),
-					(float) progress);
+					start.position().lerp(target.position(), distanceProgress),
+					Mth.rotLerp(turnProgress, start.yaw(), target.yaw()),
+					Mth.lerp(turnProgress, start.pitch(), target.pitch()),
+					Mth.lerp((float) distanceProgress, start.flightProgress(), target.flightProgress()),
+					fovBonus);
 		}
 
 		private CameraPose orbitPose(double elapsedSeconds) {

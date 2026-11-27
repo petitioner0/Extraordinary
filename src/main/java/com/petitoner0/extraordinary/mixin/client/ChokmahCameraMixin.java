@@ -1,6 +1,7 @@
 package com.petitoner0.extraordinary.mixin.client;
 
 import com.llamalad7.mixinextras.injector.ModifyExpressionValue;
+import com.llamalad7.mixinextras.injector.ModifyReturnValue;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.petitoner0.extraordinary.finalritual.chokmah.client.ChokmahClient;
 import net.minecraft.client.Camera;
@@ -43,6 +44,9 @@ public abstract class ChokmahCameraMixin {
 	@Unique
 	private float extraordinary$flightProgress;
 
+	@Unique
+	private float extraordinary$fovBonus;
+
 	@ModifyExpressionValue(method = "update", at = @At(value = "INVOKE", target = "Ljava/lang/Math;max(FF)F"))
 	private float extraordinary$extendChokmahCameraDepth(float depth) {
 		return ChokmahClient.isControllingCamera() ? Math.max(depth, 512.0F) : depth;
@@ -60,6 +64,7 @@ public abstract class ChokmahCameraMixin {
 	private void extraordinary$applyChokmahCamera(float partialTick, CallbackInfo ci) {
 		ChokmahClient.CameraPose pose = ChokmahClient.cameraPose();
 		extraordinary$flightProgress = pose == null ? 0.0F : pose.flightProgress();
+		extraordinary$fovBonus = pose == null ? 0.0F : pose.fovBonus();
 		if (pose != null) {
 			setPosition(pose.position());
 			setRotation(pose.yaw(), pose.pitch());
@@ -68,6 +73,11 @@ public abstract class ChokmahCameraMixin {
 			detached = !entity.getBoundingBox().move(renderOffset).inflate(Camera.PROJECTION_Z_NEAR).contains(pose.position());
 			ci.cancel();
 		}
+	}
+
+	@ModifyReturnValue(method = "calculateFov", at = @At("RETURN"))
+	private float extraordinary$applyChokmahDescentFov(float fov) {
+		return extraordinary$fovBonus > 0.0F ? Math.min(fov + extraordinary$fovBonus, 179.0F) : fov;
 	}
 
 	@Inject(method = "alignWithEntity", at = @At("RETURN"))
